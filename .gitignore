@@ -1,0 +1,24 @@
+# Build directories
+build/
+bin/
+lib/
+*.o
+*.so
+*.dylib
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

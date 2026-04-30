@@ -19,6 +19,7 @@ pybind11_add_module(rough_sde
     src/signatures.cpp 
     src/sde_solver.cpp 
     src/bindings.cpp
+    ${MACTENSOR_DIR}/src/core/matrix.cpp
 )
 
 # MacTensor uses Accelerate framework and standard C++

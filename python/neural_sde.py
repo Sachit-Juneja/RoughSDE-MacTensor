@@ -75,11 +75,15 @@ class EulerMaruyamaSDE(torch.autograd.Function):
                     outputs=mu_step, 
                     inputs=[z_t] + params, 
                     grad_outputs=a_t,
-                    retain_graph=False
+                    retain_graph=False,
+                    allow_unused=True
                 )
                 
-            vjp_z = grads[0].detach().numpy().reshape(-1, 1)
-            vjp_theta = np.concatenate([g.detach().flatten().numpy() for g in grads[1:]]).reshape(-1, 1)
+            vjp_z = grads[0].detach().numpy().reshape(-1, 1) if grads[0] is not None else np.zeros((z_t.numel(), 1))
+            vjp_theta = np.concatenate([
+                g.detach().flatten().numpy() if g is not None else np.zeros(p.numel())
+                for g, p in zip(grads[1:], params)
+            ]).reshape(-1, 1)
             
             return vjp_z, vjp_theta
             
@@ -100,11 +104,15 @@ class EulerMaruyamaSDE(torch.autograd.Function):
                     outputs=diff_step,
                     inputs=[z_t] + params,
                     grad_outputs=a_t,
-                    retain_graph=False
+                    retain_graph=False,
+                    allow_unused=True
                 )
                 
-            vjp_z = grads[0].detach().numpy().reshape(-1, 1)
-            vjp_theta = np.concatenate([g.detach().flatten().numpy() for g in grads[1:]]).reshape(-1, 1)
+            vjp_z = grads[0].detach().numpy().reshape(-1, 1) if grads[0] is not None else np.zeros((z_t.numel(), 1))
+            vjp_theta = np.concatenate([
+                g.detach().flatten().numpy() if g is not None else np.zeros(p.numel())
+                for g, p in zip(grads[1:], params)
+            ]).reshape(-1, 1)
             
             return vjp_z, vjp_theta
 

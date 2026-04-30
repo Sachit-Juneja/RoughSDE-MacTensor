@@ -17,6 +17,15 @@ Matrix euler_maruyama_path(
     const std::function<Matrix(float, const Matrix&)>& diffusion
 );
 
+std::tuple<Matrix, Matrix, Matrix> euler_maruyama_adjoint_path(
+    const Matrix& Z_seq,
+    const Matrix& grad_output_seq,
+    float T,
+    const Matrix& W_increments,
+    const std::function<std::pair<Matrix, Matrix>(float, const Matrix&, const Matrix&, float)>& vjp_drift,
+    const std::function<std::pair<Matrix, Matrix>(float, const Matrix&, const Matrix&, const Matrix&)>& vjp_diffusion
+);
+
 // Numpy <-> MacTensor Converters
 Matrix numpy_to_matrix(py::array_t<float> input) {
     py::buffer_info buf = input.request();
@@ -79,6 +88,40 @@ py::array_t<float> euler_maruyama_wrapper(
     return matrix_to_numpy(path);
 }
 
+// Wrapper for euler_maruyama adjoint
+py::tuple euler_maruyama_adjoint_wrapper(
+    py::array_t<float> py_Z_seq,
+    py::array_t<float> py_grad_output_seq,
+    float T,
+    py::array_t<float> py_W_increments,
+    py::function py_vjp_drift,
+    py::function py_vjp_diffusion
+) {
+    Matrix Z_seq = numpy_to_matrix(py_Z_seq);
+    Matrix grad_output_seq = numpy_to_matrix(py_grad_output_seq);
+    Matrix W_inc = numpy_to_matrix(py_W_increments);
+    
+    auto vjp_drift = [&py_vjp_drift](float t, const Matrix& Z, const Matrix& a, float dt) -> std::pair<Matrix, Matrix> {
+        py::tuple res = py_vjp_drift(t, matrix_to_numpy(Z), matrix_to_numpy(a), dt);
+        return {numpy_to_matrix(res[0].cast<py::array_t<float>>()), 
+                numpy_to_matrix(res[1].cast<py::array_t<float>>())};
+    };
+    
+    auto vjp_diffusion = [&py_vjp_diffusion](float t, const Matrix& Z, const Matrix& a, const Matrix& dW) -> std::pair<Matrix, Matrix> {
+        py::tuple res = py_vjp_diffusion(t, matrix_to_numpy(Z), matrix_to_numpy(a), matrix_to_numpy(dW));
+        return {numpy_to_matrix(res[0].cast<py::array_t<float>>()), 
+                numpy_to_matrix(res[1].cast<py::array_t<float>>())};
+    };
+    
+    auto result = euler_maruyama_adjoint_path(Z_seq, grad_output_seq, T, W_inc, vjp_drift, vjp_diffusion);
+    
+    return py::make_tuple(
+        matrix_to_numpy(std::get<0>(result)),
+        matrix_to_numpy(std::get<1>(result)),
+        matrix_to_numpy(std::get<2>(result))
+    );
+}
+
 // Module Definition
 PYBIND11_MODULE(rough_sde, m) {
     m.doc() = "Rough Neural SDE plugin using MacTensor";
@@ -98,4 +141,9 @@ PYBIND11_MODULE(rough_sde, m) {
     m.def("euler_maruyama_path", &euler_maruyama_wrapper, 
           py::arg("X0"), py::arg("T"), py::arg("W_increments"), py::arg("drift"), py::arg("diffusion"),
           "Simulate an SDE path using Euler-Maruyama");
+
+    m.def("euler_maruyama_adjoint_path", &euler_maruyama_adjoint_wrapper,
+          py::arg("Z_seq"), py::arg("grad_output_seq"), py::arg("T"), py::arg("W_increments"), 
+          py::arg("vjp_drift"), py::arg("vjp_diffusion"),
+          "Adjoint backward solver for the Euler-Maruyama method");
 }

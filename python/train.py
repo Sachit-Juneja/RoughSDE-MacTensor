@@ -3,6 +3,7 @@ import os
 import torch
 import numpy as np
 import torch.optim as optim
+import matplotlib.pyplot as plt
 
 # Add the build directory to path to import rough_sde
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'build')))
@@ -11,7 +12,6 @@ try:
     import rough_sde
 except ImportError:
     print("Failed to import rough_sde. Have you compiled the CMake project?")
-    print("Run: mkdir build && cd build && cmake .. && make")
     sys.exit(1)
 
 from neural_sde import DriftNet, DiffusionNet, EulerMaruyamaSDE
@@ -21,82 +21,144 @@ HURST = 0.1
 STEPS = 50
 T = 1.0
 DEPTH = 3
-EPOCHS = 100
-LR = 1e-3
+EPOCHS = 500
+LR = 0.005
 
 STATE_DIM = 1
 NOISE_DIM = 1
 
 def main():
     print(f"Generating true rough path with Hurst = {HURST}...")
-    # 1. Generate real rough data (fBM) using C++ MacTensor
-    # Returns (STEPS+1) x 2 array [Time, Value]
+    # 1. Generate real rough data (fBM)
     true_path = rough_sde.generate_fbm(HURST, STEPS, T)
-    
-    # 2. Extract values and apply Lead-Lag
     true_values = true_path[:, 1].reshape(-1, 1)
+    
+    # 2. Compute true signature
     true_ll = rough_sde.lead_lag_transform(true_values)
-    
-    # 3. Compute true signature
     true_sig = rough_sde.compute_signature(true_ll, DEPTH)
-    true_sig_tensor = torch.tensor(true_sig, dtype=torch.float32)
     
-    print("True signature computed. Shape:", true_sig.shape)
+    print(f"True signature computed. Shape: {true_sig.shape}")
     
-    # 4. Initialize Neural SDE
+    # 3. Initialize Neural SDE
     drift = DriftNet(STATE_DIM)
     diffusion = DiffusionNet(STATE_DIM, NOISE_DIM)
-    
-    # Optimizer
     optimizer = optim.Adam(list(drift.parameters()) + list(diffusion.parameters()), lr=LR)
     
-    # Custom training loop
-    # NOTE: Since the C++ MacTensor backend does not track PyTorch Autograd,
-    # backpropagating exactly through `euler_maruyama_path` requires either:
-    # A) The Continuous Adjoint Sensitivity Method (Neural SDEs)
-    # B) Finite Differences over parameters
-    # For demonstration of the orchestration, we use a proxy loss or assume
-    # finite differences if gradients are needed.
-    # Here we show the orchestration logic for the Signature Kernel Loss.
+    # Save Untrained Path for Visualization
+    dW_test = np.random.normal(0, np.sqrt(T/STEPS), size=(STEPS, NOISE_DIM)).astype(np.float32)
+    X0_test = np.zeros((STATE_DIM, 1), dtype=np.float32)
+    params_test = list(drift.parameters()) + list(diffusion.parameters())
+    
+    untrained_path_tensor = EulerMaruyamaSDE.apply(
+        torch.tensor(X0_test, dtype=torch.float32), T, 
+        torch.tensor(dW_test, dtype=torch.float32), 
+        drift, diffusion, *params_test
+    )
+    untrained_path = untrained_path_tensor.detach().numpy()
+
+    loss_history = []
     
     print("Starting training loop...")
     for epoch in range(EPOCHS):
         optimizer.zero_grad()
         
-        # We need to simulate the path.
-        # Generate standard Brownian increments for the solver
+        # Forward Pass
         dt = T / STEPS
         dW = np.random.normal(0, np.sqrt(dt), size=(STEPS, NOISE_DIM)).astype(np.float32)
         X0 = np.zeros((STATE_DIM, 1), dtype=np.float32)
         
-        # Use Custom Autograd SDE Solver
         params = list(drift.parameters()) + list(diffusion.parameters())
-        sim_path_tensor = EulerMaruyamaSDE.apply(torch.tensor(X0, dtype=torch.float32, requires_grad=True), T, torch.tensor(dW, dtype=torch.float32), drift, diffusion, *params)
+        sim_path_tensor = EulerMaruyamaSDE.apply(
+            torch.tensor(X0, dtype=torch.float32, requires_grad=True), T, 
+            torch.tensor(dW, dtype=torch.float32), 
+            drift, diffusion, *params
+        )
         
-        # We need the signature for the loss
         sim_path_np = sim_path_tensor.detach().numpy()
         sim_ll = rough_sde.lead_lag_transform(sim_path_np)
         sim_sig = rough_sde.compute_signature(sim_ll, DEPTH)
         
-        # Create a proxy tensor for the signature so we can flow gradients backward.
-        # Note: The true way to flow gradients back through compute_signature requires differentiating
-        # the signature computation. For demonstration, we assume we want to backpropagate
-        # directly into the path using some path-level loss, e.g. MSE against a target path.
-        # Since `compute_signature` is purely in C++, we cannot autograd through it natively.
-        # We'll compute the gradient of the MMD loss w.r.t the path manually or assume path MSE.
+        # Signature Kernel Loss (MMD)
+        loss_val = np.sum((sim_sig - true_sig) ** 2)
+        loss_history.append(loss_val)
         
-        # Proxy Path Loss for Orchestration Test
-        # loss = ||sim_path - true_path||^2
-        target_path_tensor = torch.tensor(true_path[:, 1:], dtype=torch.float32)
-        loss = torch.sum((sim_path_tensor - target_path_tensor) ** 2)
+        # To flow gradients natively through our custom C++ Adjoint Solver, 
+        # we need `grad_output`: the gradient of the MMD Loss w.r.t the simulated path.
+        # Since `compute_signature` is purely in C++, we use a lightweight finite difference 
+        # to calculate `dLoss/dPath`. The Adjoint solver will then take this `grad_output` 
+        # and backpropagate it through the Drift and Diffusion neural networks dynamically.
+        eps = 1e-4
+        grad_output = np.zeros_like(sim_path_np)
+        for i in range(sim_path_np.shape[0]):
+            for j in range(sim_path_np.shape[1]):
+                path_plus = sim_path_np.copy()
+                path_plus[i, j] += eps
+                sig_plus = rough_sde.compute_signature(rough_sde.lead_lag_transform(path_plus), DEPTH)
+                
+                path_minus = sim_path_np.copy()
+                path_minus[i, j] -= eps
+                sig_minus = rough_sde.compute_signature(rough_sde.lead_lag_transform(path_minus), DEPTH)
+                
+                l_plus = np.sum((sig_plus - true_sig) ** 2)
+                l_minus = np.sum((sig_minus - true_sig) ** 2)
+                
+                grad_output[i, j] = (l_plus - l_minus) / (2 * eps)
         
-        loss.backward()
+        # Trigger custom Adjoint C++ backward pass
+        sim_path_tensor.backward(torch.tensor(grad_output, dtype=torch.float32))
         optimizer.step()
         
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch:03d} | Path Loss: {loss.item():.6f}")
+        if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch+1:03d} | Signature MMD Loss: {loss_val:.6f}")
 
-    print("Training loop complete!")
+    print("Training complete! Generating academic visualizations...")
+    
+    # Save Trained Path for Visualization
+    trained_path_tensor = EulerMaruyamaSDE.apply(
+        torch.tensor(X0_test, dtype=torch.float32), T, 
+        torch.tensor(dW_test, dtype=torch.float32), 
+        drift, diffusion, *params_test
+    )
+    trained_path = trained_path_tensor.detach().numpy()
+    
+    # Plotting
+    try:
+        plt.style.use('seaborn-v0_8-paper')
+    except:
+        plt.style.use('ggplot')
+        
+    fig, axs = plt.subplots(1, 3, figsize=(15, 4), dpi=300)
+    t_axis = true_path[:, 0]
+    
+    # Plot 1: Untrained
+    axs[0].plot(t_axis, true_values, label='True fBM ($H=0.1$)', color='black', linewidth=1.5)
+    axs[0].plot(t_axis, untrained_path, label='Untrained Neural SDE', color='red', linestyle='--', alpha=0.8)
+    axs[0].set_title("Untrained vs True Path")
+    axs[0].set_xlabel("Time ($t$)")
+    axs[0].set_ylabel("State ($X_t$)")
+    axs[0].legend()
+    axs[0].grid(True, alpha=0.4)
+    
+    # Plot 2: Trained
+    axs[1].plot(t_axis, true_values, label='True fBM ($H=0.1$)', color='black', linewidth=1.5)
+    axs[1].plot(t_axis, trained_path, label='Trained Neural SDE', color='blue', linestyle='-', alpha=0.8)
+    axs[1].set_title("Trained vs True Path")
+    axs[1].set_xlabel("Time ($t$)")
+    axs[1].legend()
+    axs[1].grid(True, alpha=0.4)
+    
+    # Plot 3: Convergence
+    # Add a small epsilon to avoid log(0) if loss becomes perfectly 0
+    axs[2].plot(range(EPOCHS), np.log10(np.array(loss_history) + 1e-12), color='green', linewidth=2)
+    axs[2].set_title("Signature Kernel Convergence")
+    axs[2].set_xlabel("Epochs")
+    axs[2].set_ylabel("$\log_{10}$(MMD Loss)")
+    axs[2].grid(True, alpha=0.4)
+    
+    plt.tight_layout()
+    output_file = os.path.join(os.path.dirname(__file__), "..", "rough_volatility_results.pdf")
+    plt.savefig(output_file, bbox_inches='tight')
+    print(f"Saved publication-quality plot to: {output_file}")
 
 if __name__ == "__main__":
     main()

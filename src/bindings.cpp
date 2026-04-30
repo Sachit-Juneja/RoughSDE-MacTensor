@@ -9,6 +9,8 @@ namespace py = pybind11;
 Matrix generate_fbm(float H, size_t N, float T);
 Matrix lead_lag_transform(const Matrix& X);
 Matrix compute_signature(const Matrix& path, size_t depth);
+Matrix compute_signature_backward(const Matrix& path, const Matrix& grad_output, size_t depth);
+Matrix lead_lag_transform_backward(const Matrix& path, const Matrix& grad_LL);
 Matrix euler_maruyama_path(
     const Matrix& X0,
     float T,
@@ -137,6 +139,14 @@ PYBIND11_MODULE(rough_sde, m) {
     m.def("compute_signature", [](py::array_t<float> py_path, size_t depth) {
         return matrix_to_numpy(compute_signature(numpy_to_matrix(py_path), depth));
     }, py::arg("path"), py::arg("depth"), "Compute truncated signature of a discrete path");
+
+    m.def("compute_signature_backward", [](py::array_t<float> py_path, py::array_t<float> py_grad_output, size_t depth) {
+        return matrix_to_numpy(compute_signature_backward(numpy_to_matrix(py_path), numpy_to_matrix(py_grad_output), depth));
+    }, py::arg("path"), py::arg("grad_output"), py::arg("depth"), "Compute the exact analytical gradient of the signature w.r.t the path");
+
+    m.def("lead_lag_transform_backward", [](py::array_t<float> py_path, py::array_t<float> py_grad_LL) {
+        return matrix_to_numpy(lead_lag_transform_backward(numpy_to_matrix(py_path), numpy_to_matrix(py_grad_LL)));
+    }, py::arg("path"), py::arg("grad_LL"), "Apply backward pass for Lead-Lag transformation");
 
     m.def("euler_maruyama_path", &euler_maruyama_wrapper, 
           py::arg("X0"), py::arg("T"), py::arg("W_increments"), py::arg("drift"), py::arg("diffusion"),

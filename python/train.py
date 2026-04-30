@@ -84,25 +84,15 @@ def main():
         
         # To flow gradients natively through our custom C++ Adjoint Solver, 
         # we need `grad_output`: the gradient of the MMD Loss w.r.t the simulated path.
-        # Since `compute_signature` is purely in C++, we use a lightweight finite difference 
-        # to calculate `dLoss/dPath`. The Adjoint solver will then take this `grad_output` 
-        # and backpropagate it through the Drift and Diffusion neural networks dynamically.
-        eps = 1e-4
-        grad_output = np.zeros_like(sim_path_np)
-        for i in range(sim_path_np.shape[0]):
-            for j in range(sim_path_np.shape[1]):
-                path_plus = sim_path_np.copy()
-                path_plus[i, j] += eps
-                sig_plus = rough_sde.compute_signature(rough_sde.lead_lag_transform(path_plus), DEPTH)
-                
-                path_minus = sim_path_np.copy()
-                path_minus[i, j] -= eps
-                sig_minus = rough_sde.compute_signature(rough_sde.lead_lag_transform(path_minus), DEPTH)
-                
-                l_plus = np.sum((sig_plus - true_sig) ** 2)
-                l_minus = np.sum((sig_minus - true_sig) ** 2)
-                
-                grad_output[i, j] = (l_plus - l_minus) / (2 * eps)
+        # We calculate the exact analytical gradient of the Signature Loss.
+        # L = ||S_sim - S_true||^2  =>  dL/dS_sim = 2 * (S_sim - S_true)
+        g_sig = 2.0 * (sim_sig - true_sig)
+        
+        # Exact Backward Pass through Signature
+        grad_ll = rough_sde.compute_signature_backward(sim_ll, g_sig, DEPTH)
+        
+        # Exact Backward Pass through Lead-Lag transformation
+        grad_output = rough_sde.lead_lag_transform_backward(sim_path_np, grad_ll)
         
         # Trigger custom Adjoint C++ backward pass
         sim_path_tensor.backward(torch.tensor(grad_output, dtype=torch.float32))

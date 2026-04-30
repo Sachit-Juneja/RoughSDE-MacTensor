@@ -238,14 +238,13 @@ Matrix compute_signature_backward(const Matrix& path, const Matrix& grad_output,
         
         std::vector<float> prev_tensor(1, 1.0f);
         std::vector<float> grad_prev_tensor(1, 0.0f);
-        size_t current_offset = 1;
         
-        // We need to backpropagate through the iterative tensor product
-        // We will store forward pass intermediate prev_tensors
-        std::vector<std::vector<float>> prev_tensor_history(depth);
-        prev_tensor_history[0] = prev_tensor;
+        // Cache forward intermediate tensors for ALL levels 0..depth
+        // prev_tensor_history[k] = Delta^{\otimes k} (unnormalized)
+        std::vector<std::vector<float>> prev_tensor_history(depth + 1);
+        prev_tensor_history[0] = prev_tensor;  // scalar 1.0
         
-        for (size_t k = 1; k < depth; ++k) {
+        for (size_t k = 1; k <= depth; ++k) {
             std::vector<float> next_tensor(level_sizes[k]);
             for (size_t u = 0; u < level_sizes[k - 1]; ++u) {
                 for (size_t v = 0; v < d; ++v) {
@@ -256,32 +255,37 @@ Matrix compute_signature_backward(const Matrix& path, const Matrix& grad_output,
             prev_tensor_history[k] = prev_tensor;
         }
         
-        // Now go backward through the levels
-        std::vector<float> grad_next_tensor;
+        // Backward through the levels: seg_S[level k] = prev_tensor_history[k] / k!
+        // grad_next_tensor propagates from higher levels via the recurrence
+        grad_prev_tensor.assign(1, 0.0f);
+        
         for (int k = depth; k >= 1; --k) {
             float factorial = 1.0f;
             for(int f=1; f<=k; ++f) factorial *= static_cast<float>(f);
             
             size_t C_offset = 0;
-            for(int l=0; l<=k; ++l) C_offset += level_sizes[l];
-            C_offset -= level_sizes[k]; // offset to current level
+            for(int l=0; l<k; ++l) C_offset += level_sizes[l];
             
-            grad_next_tensor.assign(level_sizes[k], 0.0f);
+            // grad through seg_S[level k] = tensor_k / k!
+            std::vector<float> grad_tensor_k(level_sizes[k], 0.0f);
             for (size_t idx = 0; idx < level_sizes[k]; ++idx) {
-                grad_next_tensor[idx] += grad_seg_S[C_offset + idx] / factorial;
+                grad_tensor_k[idx] = grad_seg_S[C_offset + idx] / factorial;
             }
-            // Add gradients coming from higher level next_tensor (if any)
+            // Plus gradient flowing back from the next tensor product (level k+1)
             if (k < (int)depth) {
                 for (size_t idx = 0; idx < level_sizes[k]; ++idx) {
-                    grad_next_tensor[idx] += grad_prev_tensor[idx];
+                    grad_tensor_k[idx] += grad_prev_tensor[idx];
                 }
             }
             
+            // tensor_k[u*d+v] = prev_tensor_history[k-1][u] * delta[v]
+            // => grad w.r.t prev_tensor_history[k-1][u] += grad_tensor_k[u*d+v] * delta[v]
+            // => grad w.r.t delta[v] += grad_tensor_k[u*d+v] * prev_tensor_history[k-1][u]
             grad_prev_tensor.assign(level_sizes[k - 1], 0.0f);
             for (size_t u = 0; u < level_sizes[k - 1]; ++u) {
                 for (size_t v = 0; v < d; ++v) {
-                    grad_prev_tensor[u] += grad_next_tensor[u * d + v] * delta[v];
-                    grad_delta[v] += grad_next_tensor[u * d + v] * prev_tensor_history[k - 1][u];
+                    grad_prev_tensor[u] += grad_tensor_k[u * d + v] * delta[v];
+                    grad_delta[v] += grad_tensor_k[u * d + v] * prev_tensor_history[k - 1][u];
                 }
             }
         }
